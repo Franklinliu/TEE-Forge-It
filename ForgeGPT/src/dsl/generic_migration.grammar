@@ -1,0 +1,12 @@
+Strategy ::= Rule*
+Rule ::= RenameFunc(Func1, Func2) || Substitute(Var, Var, Scope) || Move(Node, Scope1, Scope2) || Insert(Node, Scope)  || Remove(Node, Scope) || Replace(Node, Node, Scope)
+Modifier ::= static || const
+Var  ::=  Identifier : Modifier? Type
+Exp  ::= Identifier || Constant || Exp op Exp
+Stmt ::= Exp || Break || Continue ||If {Exp} Block ||If {Exp} Block else Block
+        || While {Exp} Block || For {Exp1, Exp2, Exp3} Block
+        || Return Exp || Goto Id
+Block ::= Stmt || Stmt * || #ifdef Identifier Block #endif || #ifdef Identifier Block #elif Block #endif 
+Node ::= Exp || Stmt || Block 
+Func ::= Identifier: (Var *) -> (Var *)
+Scope ::= Func || Block

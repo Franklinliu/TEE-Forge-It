@@ -1,0 +1,3 @@
+[submodule "ForgeGPT/tree-sitter-c"]
+	path = ForgeGPT/tree-sitter-c
+	url = https://github.com/tree-sitter/tree-sitter-c.git

@@ -1,0 +1,77 @@
+Migration      ::= "migration" Id "{" Phase* "}"
+Phase          ::= CargoPhase | ModulePhase | CodePhase 
+
+CargoPhase     ::= "cargo" "{" CargoStmt+ "}"
+CargoStmt      ::= CargoAddDep | CargoRmDep | CargoFeature 
+CargoAddDep    ::= "add" Id ( "{" DepKV ("," DepKV)* "}" )?
+DepKV          ::= ("version" ":" String)
+                 | ("optional" ":" Bool)
+                 | ("features" ":" "[" IdList? "]")
+                 | ("default-features" ":" Bool)
+                 | ("path" ":" String) | ("git" ":" String) | ("rev" ":" String)
+CargoRmDep     ::= "remove" Id
+
+CargoFeature   ::= "feature" Id ( "enable" | "disable" )
+
+ModulePhase    ::= "modules" "{" ModuleStmt+ "}"
+ModuleStmt     ::= "create" Path ":" "file" String
+                 | "rename" Path "->" Path
+                 | "delete" Path
+
+CodePhase      ::= "code" "{" Rule+ "}"
+Rule           ::= "rule" Id "{" MatchClause GuardClause? RewriteClause ScopeClause? "}"
+MatchClause    ::= "match" ":" Pattern
+GuardClause    ::= "when" ":" BoolExpr
+RewriteClause  ::= "rewrite" ":" RewriteSeq
+ScopeClause    ::= "in" ":" Scope
+Scope          ::= "crate(" Id ")" | "workspace" | "path(" String ")"
+
+Pattern        ::= TsQuery | PathPattern | CallPattern | ImportPattern | AttrPattern
+TsQuery        ::= "ts(" String ")"            (* Tree-sitter query *)
+PathPattern    ::= "path(" RustPath ("::" "*")? ")"
+CallPattern    ::= "call(" RustPath ("," ArgConstraintList)? ")"
+ImportPattern  ::= "extern crate " Id ";"
+AttrPattern    ::= "attr(" "#" "[" Id ( "(" .*? ")" )? "]" ")"
+
+ArgConstraintList ::= ArgConstraint ("," ArgConstraint)*
+ArgConstraint  ::= "arg" Int ":" ArgPred
+ArgPred        ::= "is_literal" | "is_path(" RustPath ")" | "type(" TyExpr ")"
+
+RewriteSeq     ::= RewriteOp (";" RewriteOp)*
+RewriteOp      ::= ReplacePath | ReplaceImport | InsertUse
+                 | ReplaceCall | MapArgs | AddAttr | RemoveAttr
+                 | EditText | ApplyFix
+ReplacePath    ::= "replace_path" "(" RustPath "->" RustPath ")"
+ReplaceImport  ::= "replace_use" "(" Id "->" Id ")"
+InsertUse      ::= "insert_use" "(" RustPath (" as " Id)? ("," "at" ":" ("root"|"module"))? ")"
+ReplaceCall    ::= "replace_call" "(" RustPath "->" RustPath ")"
+MapArgs        ::= "map_args" "(" ArgMapSpec ")"
+ArgMapSpec     ::= ( "permute" ":" "[" IntList "]" )?
+                   ( "," "prepend" ":" ArgList )?
+                   ( "," "append" ":" ArgList )?
+AddAttr        ::= "add_attr" "(" AttrSpec ("," "at" ":" ("item"|"fn"|"impl"|"mod"))? ")"
+RemoveAttr     ::= "remove_attr" "(" AttrSpec ")"
+EditText       ::= "edit_text" "(" "hunk" ":" String ")"   (* last resort *)
+ApplyFix       ::= "apply_fix" "(" FixName ("," KVList)? ")"
+
+
+(* Lexical *)
+Id          ::= /[A-Za-z_][A-Za-z0-9_]*/
+RustPath       ::= Id ("::" Id)*
+String         ::= '"' .*? '"'         (* escaped *)
+Bool           ::= "true" | "false"
+Int            ::= /[0-9]+/
+IntList        ::= Int ("," Int)*
+IdList      ::= Id ("," Id)*
+ArgList        ::= Expr ("," Expr)*
+KVList         ::= KV ("," KV)*
+KV             ::= Id ":" Expr
+Expr           ::= String | Int | Bool | RustPath
+TyExpr         ::= String              (* type expression, e.g., "&[u8]" *)
+BoolExpr       ::= Pred (("&&" | "||") Pred)*
+Pred           ::= "exists(" Pattern ")"
+                 | "count(" Pattern ")" RelOp Int
+                 | "feature_enabled(" Id ")"
+                 | "compiles" | "tests_pass"
+                 | "(" BoolExpr ")"
+RelOp          ::= "==" | "!=" | ">" | ">=" | "<" | "<="

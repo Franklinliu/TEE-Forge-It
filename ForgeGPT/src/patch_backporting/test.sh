@@ -1,0 +1,2 @@
+cd /workspaces/TEE-Forge-It/ForgeGPT
+python3 -m src.patch_backporting.main --input "Generate DSL code that transform the original program to the target program." --pre-transform-code ./examples/backporting/pre_patch_code.txt --post-transform-code ./examples/backporting/target_code.txt --target-code ./examples/backporting/post_patch_code.txt --dry-run
