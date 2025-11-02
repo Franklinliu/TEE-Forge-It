@@ -2,15 +2,22 @@ import os
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import trace
 from typing import Optional
 import editdistance
 import difflib
-from .agentic_backport import patch_backport
+import logging 
+
+from numpy import save
+from .agentic_backport import patch_backport, setup_logging
 from .fcu import FunctionCompareUtilities
 vim_neovim_file_path = "/workspaces/TEE-Forge-It/baseline/dataset/PPatHF/Neovim-Vim/vim_neovim_test_all.json"
 
+
+mylogger: logging.Logger = setup_logging(os.path.dirname(vim_neovim_file_path))
+
 fcu = FunctionCompareUtilities()
-def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_workers: int = 1):
+def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_workers: int = 1, sample_size: Optional[int] = None, case_id: Optional[int] = None, restore_eval: bool = True ):
     """Load json_data and run main_impl for each item in parallel using threads.
 
     Results are collected and written to two files:
@@ -22,15 +29,22 @@ def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_w
     min_workers = min_workers
     
     total = len(json_data)
-    print(f"Loaded {total} items from {vim_neovim_file_path}")
+    mylogger.debug(f"Loaded {total} items from {vim_neovim_file_path}")
+    if sample_size is None:
+        sample_size = total
+    if case_id is not None:
+        json_data = [json_data[case_id]]
+    else:
+        json_data = json_data[:sample_size]
     
-    sample_size = total
-    json_data = json_data[:sample_size]
-
     raw_results = [None] * total
     gen_results = [None] * total
     output_path = vim_neovim_file_path.replace(".json", "_" + model_name + "_agentic_backport_result.txt")
     output_raw_path = vim_neovim_file_path.replace(".json", "_" + model_name +  "_agentic_backport_raw_result.json")
+    
+    saved_results: list = []
+    if os.path.exists(output_raw_path):
+        saved_results = json.load(open(output_raw_path))
 
     if max_workers is None:
         cpu = os.cpu_count() or 1
@@ -41,13 +55,20 @@ def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_w
 
         Returns: {"index": i, "raw": res_or_none, "result": final_result_str}
         """
-        print(f"======== Submitting item {i+1}/{total}: {item.get('commit_id_target')} ========")
+        mylogger.debug(f"======== Submitting item {i+1}/{total}: {item.get('commit_id_target')} ========")
         func_before_source = item.get('func_before_source')
         func_before_target = item.get('func_before_target')
         func_after_source = item.get('func_after_source')
         func_after_target = item.get('func_after_target')
-
+        
         try:
+            if restore_eval:
+                matched_results = list(filter(lambda x: "vim_code" in x and x.get("vim_code").strip() == func_before_source.strip() and "neovim_code" in x and x.get("neovim_code").strip() == func_before_target.strip(), saved_results))
+                if len(matched_results) > 0:
+                    mylogger.debug(f"Found cached result for item {i+1}.")
+                    saved_res = matched_results[0]
+                    patched_result = saved_res.get("patched")
+                    return {"index": i, "raw": saved_res, "result": patched_result}
             # Persist in-memory source strings to temporary files and pass paths
             tmp_files = []
             try:
@@ -85,12 +106,19 @@ def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_w
                 exact_match = distance == 0
                 res["similarity"] = similarity
                 res["exact_match"] = exact_match
+                res["vim_code"] = func_before_source
+                res["neovim_code"] = func_before_target
+                res["commit_id_target"] = item.get('commit_id_target')
+                
                 return {"index": i, "raw": res, "result": result}
             else:
                 return {"index": i, "raw": res, "result": func_before_target}
         except Exception as e:
-            print(f"Error processing item {i+1}: {e}")
-            return {"index": i, "raw": {"error": str(e)}, "result": func_before_target}
+            import traceback
+            traceback.print_exc()
+            mylogger.debug(f"Error processing item {i+1}: {e}")
+            exit(-1)
+            # return {"index": i, "raw": {"error": str(e)}, "result": func_before_target}
 
     # Submit all tasks
     futures = {}
@@ -121,7 +149,7 @@ def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_w
             gen_results[idx] = final_result
             raw_results[idx] = raw
 
-            print(f"Completed item {idx+1}/{total}")
+            mylogger.debug(f"Completed item {idx+1}/{total}")
             
             # Append raw result (order of completion)
             with open(output_raw_path, 'w') as f:
@@ -132,8 +160,8 @@ def run_eval(max_workers: Optional[int] = None, model_name: str = "gpt4o", min_w
                 # json.dump([r for r in gen_results if r is not None], f, indent=4)
                 f.write("\n".join([r for r in gen_results if r is not None]))
 
-    print(f"Saved raw results to {output_raw_path}")
-    print(f"Saved results to {output_path}")
+    mylogger.debug(f"Saved raw results to {output_raw_path}")
+    mylogger.debug(f"Saved results to {output_path}")
    
 
 if __name__ == "__main__":
@@ -141,6 +169,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="gpt4o", help="Model to use for evaluation. Options: gpt4o, gpt4o_mini, qwen3coder_30b")
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of workers to use")
-
+    parser.add_argument("--sample_size", type=int, default=None, help="Sample size to use for evaluation")
+    parser.add_argument("--case_id", type=int, default=None, help="Specific case id for evaluation")
+    # add a switch to control whether run the evaluation from the scratch.
+    parser.add_argument("--restore_eval", action="store_true", default=False)
+    
     args = parser.parse_args()
-    run_eval(model_name=args.model, min_workers=args.max_workers)
+    run_eval(model_name=args.model, min_workers=args.max_workers, sample_size=args.sample_size, case_id=args.case_id, restore_eval=args.restore_eval)

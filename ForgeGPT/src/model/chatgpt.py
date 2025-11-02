@@ -14,20 +14,20 @@ OPEN_API_KEY = os.getenv("OPENAI_API_KEY")
 # 请确保已设置OPENAI_API_KEY环境变量，或在此处直接传递api_key参数
 gpt3_5_turbo = ChatOpenAI(
     model="gpt-3.5-turbo",
-    temperature=1,
+    temperature=0.7,
     api_key=OPEN_API_KEY,
     stream_usage=True
 )
 gpt4o_mini = ChatOpenAI(
     model="gpt-4o-mini",
-    temperature=0.5,
+    temperature=0.7,
     api_key=OPEN_API_KEY,
     stream_usage=True 
 )
 
 gpt4o = ChatOpenAI(
     model="gpt-4o",
-    temperature = 1,
+    temperature = 0.7,
     api_key = OPEN_API_KEY,
     stream_usage = True
 )

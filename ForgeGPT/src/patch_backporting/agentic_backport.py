@@ -9,12 +9,10 @@ from venv import create
 from git import Optional
 import logging
 from langchain.tools import tool
+from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
-from langchain import hub
-from langchain import hub
 from langchain.schema import HumanMessage, AIMessage
-from pydantic import BaseModel, Field, field_validator
 from tenacity import retry, stop_after_attempt, wait_random
 
 from langchain_core.output_parsers import JsonOutputParser
@@ -34,9 +32,11 @@ fmt = parser.get_format_instructions()
 # from src.model.chatgpt import gpt4o as model 
 
 model = None
-
+modelName = None 
 def set_model(model_name: str):
     global model
+    global modelName
+    modelName = model_name
     if model_name == "gpt4o":
         from src.model.chatgpt import gpt4o as selected_model
     elif model_name == "gpt4o_mini":
@@ -47,6 +47,29 @@ def set_model(model_name: str):
         from src.model.chatgpt import gpt4o as selected_model
     model = selected_model
 
+import time 
+import random 
+import os 
+
+mylogger: logging.Logger = logging.getLogger(__name__)
+
+def setup_logging(log_path):
+    global mylogger
+    os.makedirs(log_path, exist_ok=True)
+    name = f"backport"
+    logger = logging.getLogger(name)
+    fh = logging.FileHandler(os.path.join(log_path, f'patchbackport_{str(time.time())}_{random.randint(0, 999999)}.log'))
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        logger.addHandler(fh)
+    if logger.level == 0:
+        logger.setLevel(logging.DEBUG)
+    
+    mylogger = logger
+    return logger
+                
 import json, re
 
 def strip_code_fences(s: str) -> str:
@@ -99,12 +122,12 @@ def create_user_messages(prompt: str) -> List[dict]:
 
 def create_user_message(prompt: str) -> dict:
     """Create user messages for agent invocation."""
-    print("[USER]", prompt)
+    mylogger.debug("[USER]" + prompt)
     return {"role": "user", "content": prompt}
 
 def create_assistant_message(prompt: str) -> dict:
     """Create assistant messages for agent invocation."""
-    print("[ASSISTANT]", prompt)
+    mylogger.debug("[ASSISTANT]" + prompt)
     return {"role": "assistant", "content": prompt}
 
 def add_retry_to_tool(tool, max_attempts=3):
@@ -154,11 +177,10 @@ def get_plan(response: object, llm_usage_recorder: LLMUsageRecorder):
     try:  
         json_text = text.replace("<tool_call>", "").strip()
         plan = coerce_json(json_text)
-        last_msg = create_assistant_message(json.dumps(plan, indent=2))
-        # print("[PLAN] Parsed plan:", json.dumps(plan, indent=2))
+        # mylogger.debug("[PLAN] Parsed plan:", json.dumps(plan, indent=2))
     except Exception as e:
         raise Exception(f"[ERROR]Plan should be a JSON array object. Parsing error: {e}")
-    return plan, last_msg
+    return plan
        
 def get_code(response: object, llm_usage_recorder: LLMUsageRecorder):
     text = get_text(response, llm_usage_recorder)
@@ -222,15 +244,16 @@ def preprocess(step):
         
         if old_statement == new_statement:
             raise Exception("[ERROR] Cannot replace the same statement with itself")
-        if old_statement.strip().startswith("if") and new_statement.strip().startswith("if"):
-            if not old_statement.endswith("}"):
+        if old_statement.startswith("if") and new_statement.startswith("if"):
+            if not old_statement.endswith("}") and not old_statement.endswith(";") \
+                and not new_statement.endswith("}") and not new_statement.endswith(";"):
                 # write re pattern match to get condition of old if-statement
                 import re
                 match = re.search(r'if\s*\((.*)\)', old_statement, re.DOTALL)
                 old_condition = match.group(1) if match else None
                 match = re.search(r'if\s*\((.*)\)', new_statement, re.DOTALL)
                 new_condition = match.group(1) if match else None
-                print("Attempt to replace: ", old_condition, new_condition)
+                mylogger.debug(f"Attempt to replace: {old_condition} with {new_condition}")
                 if old_condition and new_condition and old_condition.strip() != new_condition.strip():
                     step["tool"] = "ifguard_modify_in_codebase"
                     args["if_statement"] = old_statement
@@ -239,7 +262,7 @@ def preprocess(step):
                     args.pop("old_statement", None)
                     args.pop("new_statement", None)
                     args.pop("destination_function", None)
-                    args.pop("destination_location_prev_statement", None)
+                    args.pop("destination_location_preceding_statement", None)
                     args.pop("destination_location_next_statement", None)
                     step["payload"] = args
                     return step  
@@ -278,38 +301,45 @@ def get_user_error_feedback(step: dict):
     
     tool_name = step.get("tool")
     args = step.get("payload", {})
+    
+    default_feedback = "Check the previous patch step. Correct it if any inaccuracies or inconsistencies exist. Otherwise, drop it and regenerate new patch steps."
 
     if tool_name == "insert_statements_in_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "remove_statements_from_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "replace_statements_in_codebase":
         if args.get("old_statement") == args.get("new_statement"):
             return "[ERROR] Cannot replace the same statement with itself"
         else:
-            old_statement = args.get("old_statement").strip()
-            new_statement = args.get("new_statement").strip()
+            old_statement = args.get("old_statement")
+            new_statement = args.get("new_statement")
+            if isinstance(old_statement, list):
+                old_statement = "\n".join(old_statement)
+            if isinstance(new_statement, list):
+                new_statement = "\n".join(new_statement)
+            
+            old_statement  = " ".join(old_statement.strip().split())
+            new_statement = " ".join(new_statement.strip().split())
+            
             # when old_statement and new_statement is if-statement
             # consider use ifguard_modify_in_codebase tool
             if old_statement.startswith("if") and new_statement.startswith("if"):
-                if not old_statement.endswith("}"):
-                    return "[ERROR] Cannot replace if-statement with if-statement. [FIX] MUST Use ifguard_modify_in_codebase tool in the new plan."
-                else:
-                    return ""
+                return "TRY Use ifguard_modify_in_codebase tool in the new plan."
             else:
-                return ""
+                return default_feedback
     elif tool_name == "move_statements_in_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "ifguard_statements_in_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "ifguard_modify_in_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "ifguard_condition_simplify_in_codebase":
-        return ""
+        return default_feedback
     elif tool_name == "rename_in_codebase":
-        return ""
+        return default_feedback
     else:
-        return ""
+        return default_feedback
 
 
 @tool
@@ -330,26 +360,26 @@ def compute_code_diff(src: str, target: str):
     return code_diff
 
 @tool("insert_statements_in_codebase", args_schema=InsertArgs)
-def insert_statements_in_codebase(codebase: str, statements: str, destination_function: str, destination_location_prev_statement:str, destination_location_next_statement: str) -> str:
-    """Insert statements into the codebase; return modified code. If a new statement (denoted as X) is added in the patched codebase, USE insert_statements_in_codebase tool. destination_location_prev_statement and destination_location_next_statement MUST refer to declaration/expression/return statements and MUST be provided to indicate the insertion location."""
+def insert_statements_in_codebase(codebase: str, statements: str, destination_function: Optional[str], destination_location_preceding_statement: Optional[str], destination_location_next_statement: Optional[str]) -> str:
+    """Insert statements into the codebase; return modified code. If a new statement (denoted as X) is added in the patched codebase, USE insert_statements_in_codebase tool. destination_location_preceding_statement and destination_location_next_statement MUST refer to declaration/expression/return statements and MUST be provided to indicate the insertion location."""
     
     if isinstance(statements, str):
         statements = statements.strip()
         if statements == "{" or statements == "}":
             return codebase 
     
-    destination_location_prev_statement = destination_location_prev_statement.strip().strip("{")
+    destination_location_preceding_statement = destination_location_preceding_statement.strip().strip("{")
     destination_location_next_statement = destination_location_next_statement.strip().strip("}")
-    if destination_location_prev_statement == "" and destination_location_next_statement == "":
+    if destination_location_preceding_statement == "" and destination_location_next_statement == "":
         return codebase  # No insertion needed if both locations are empty
-    if destination_location_prev_statement == destination_location_next_statement:
+    if destination_location_preceding_statement == destination_location_next_statement:
         return codebase  # No insertion needed if both locations are the same
 
     obj = InsertArgs(
         codebase=codebase,
         statements=statements,
         destination_function=destination_function,
-        destination_location_prev_statement=destination_location_prev_statement,
+        destination_location_preceding_statement=destination_location_preceding_statement,
         destination_location_next_statement=destination_location_next_statement
     )
     result = insert(obj)
@@ -360,25 +390,25 @@ def insert_statements_in_codebase(codebase: str, statements: str, destination_fu
 
 
 @tool("remove_statements_from_codebase", args_schema=RemoveArgs)
-def remove_statements_from_codebase(codebase: str, statements: str, destination_function: str, destination_location_prev_statement:str,  destination_location_next_statement: str) -> str:
+def remove_statements_from_codebase(codebase: str, statements: str, destination_function: Optional[str], destination_location_preceding_statement: Optional[str],  destination_location_next_statement: Optional[str]) -> str:
     """Remove statements from the codebase; return modified code. ONLY If a statement in the original codebase is removed entirely in its patched version, USE remove_statements_from_codebase tool, where statement MUST be expression statements or if-statement or if-else-statement."""
     if isinstance(statements, str):
         statements = statements.strip()
         if statements == "{" or statements == "}":
             return codebase 
         
-    destination_location_prev_statement = destination_location_prev_statement.strip().strip("{")
+    destination_location_preceding_statement = destination_location_preceding_statement.strip().strip("{")
     destination_location_next_statement = destination_location_next_statement.strip().strip("}")
-    if destination_location_prev_statement == "" and destination_location_next_statement == "":
+    if destination_location_preceding_statement == "" and destination_location_next_statement == "":
         return codebase  # No insertion needed if both locations are empty
-    if destination_location_prev_statement == destination_location_next_statement:
+    if destination_location_preceding_statement == destination_location_next_statement:
         return codebase  # No insertion needed if both locations are the same
     
     obj = RemoveArgs(
         codebase=codebase,
         statements=statements,
         destination_function=destination_function,
-        destination_location_prev_statement=destination_location_prev_statement,
+        destination_location_preceding_statement=destination_location_preceding_statement,
         destination_location_next_statement=destination_location_next_statement
     )
     result = remove(obj)
@@ -390,19 +420,19 @@ def remove_statements_from_codebase(codebase: str, statements: str, destination_
 
 
 @tool("move_statements_in_codebase", args_schema=MoveArgs)
-def move_statements_in_codebase(codebase: str, statements: str,  destination_function: str, destination_location_prev_statement:str,  destination_location_next_statement: str) -> str:
+def move_statements_in_codebase(codebase: str, statements: str,  destination_function: Optional[str], destination_location_preceding_statement: Optional[str],  destination_location_next_statement: Optional[str]) -> str:
     """Move statements within the codebase to a new location; return modified code. ONLY If a statement is located at different places in the original and patched codebase respectively, USE move_statements_in_codebase tool, where statement MUST be expression statements, where statement MUST be expression statements or if-statement or if-else-statement.."""
-    destination_location_prev_statement = destination_location_prev_statement.strip().strip("{")
+    destination_location_preceding_statement = destination_location_preceding_statement.strip().strip("{")
     destination_location_next_statement = destination_location_next_statement.strip().strip("}")
-    if destination_location_prev_statement == "" and destination_location_next_statement == "":
+    if destination_location_preceding_statement == "" and destination_location_next_statement == "":
         return codebase  # No insertion needed if both locations are empty
-    if destination_location_prev_statement == destination_location_next_statement:
+    if destination_location_preceding_statement == destination_location_next_statement:
         return codebase  # No insertion needed if both locations are the same
 
     obj = MoveArgs(codebase=codebase, statements=statements, 
                    destination_function=destination_function,
                    destination_location_next_statement = destination_location_next_statement,
-                   destination_location_prev_statement=destination_location_prev_statement)
+                   destination_location_preceding_statement=destination_location_preceding_statement)
     result = move(obj)
     if isinstance(result, bytes):
         result = result.decode()
@@ -411,13 +441,13 @@ def move_statements_in_codebase(codebase: str, statements: str,  destination_fun
 
 
 @tool("replace_statements_in_codebase", args_schema=ReplaceArgs)
-def replace_statements_in_codebase(codebase: str, old_statement: str, new_statement: str,  destination_function: str, destination_location_prev_statement:str,  destination_location_next_statement: str) -> str:
+def replace_statements_in_codebase(codebase: str, old_statement: str, new_statement: str,  destination_function: Optional[str], destination_location_preceding_statement: Optional[str],  destination_location_next_statement: Optional[str]) -> str:
     """Replace old statements with new statements in the codebase; return modified code. ONLY If a statement (X) in the original codebase is replaced by another statement (Y) in its patched version, USE replace_statements_in_codebase tool. Note this tool only supports one-to-one replacement, where old_statement and new_statement (X and Y) MUST be of the same statement type, e.g., both are expression statements or both are if-statements. Note we CANNOT use this tool to replace a statement with multiple statements or vice versa. We CANNOT use this tool to replace a function definition with another function definition."""
-    destination_location_prev_statement = destination_location_prev_statement.strip().strip("{")
+    destination_location_preceding_statement = destination_location_preceding_statement.strip().strip("{")
     destination_location_next_statement = destination_location_next_statement.strip().strip("}")
-    if destination_location_prev_statement == "" and destination_location_next_statement == "":
+    if destination_location_preceding_statement == "" and destination_location_next_statement == "":
         return codebase  # No insertion needed if both locations are empty
-    if destination_location_prev_statement == destination_location_next_statement:
+    if destination_location_preceding_statement == destination_location_next_statement:
         return codebase  # No insertion needed if both locations are the same
     
     if old_statement.strip() == new_statement.strip():
@@ -430,7 +460,7 @@ def replace_statements_in_codebase(codebase: str, old_statement: str, new_statem
         old_statement=old_statement,
         destination_function=destination_function,
         destination_location_next_statement=destination_location_next_statement,
-        destination_location_prev_statement = destination_location_prev_statement
+        destination_location_preceding_statement = destination_location_preceding_statement
     )
     result = replace(obj)
     if isinstance(result, bytes):
@@ -520,6 +550,7 @@ def create_normal_agent(tools=[]):
 
 
 def create_patching_agent():
+    global modelName
     tools = [
         insert_statements_in_codebase,
         remove_statements_from_codebase,
@@ -527,10 +558,12 @@ def create_patching_agent():
         move_statements_in_codebase,
         ifguard_statements_in_codebase,
         ifguard_modify_in_codebase,
-        ifguard_condition_simplify_in_codebase,
+        # ifguard_condition_simplify_in_codebase,
         rename_in_codebase,
         compute_code_diff
     ]
+    # if modelName == "gpt-4o":
+    #     tools.remove(compute_code_diff)
     tools = [add_retry_to_tool(t) for t in tools]
     prompt = "You are a helpful patch agent."
     # create a patch backporting planner agent
@@ -552,27 +585,29 @@ def create_patch_backporting_agent():
     )
     return agent
 
-# given an existing codebase and its patched version, reverse engineer the patch steps
-def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path: str, llm_usage_recorder: LLMUsageRecorder = LLMUsageRecorder()) -> dict:
-    # Plan / Execute / Decision / Replan loop
-    max_iterations = 5
-    original_code = open(original_codebase_path).read()
-    target_code = open(patched_codebase_path).read()
-    
-    # trim code to only the parts containing diffs
 
-    # helper: map tool name -> callable
-    tool_map = {
+# helper: map tool name -> callable
+tool_map = {
         "insert_statements_in_codebase": insert_statements_in_codebase,
         "remove_statements_from_codebase": remove_statements_from_codebase,
         "replace_statements_in_codebase": replace_statements_in_codebase,
         "move_statements_in_codebase": move_statements_in_codebase,
         "ifguard_statements_in_codebase": ifguard_statements_in_codebase,
         "ifguard_modify_in_codebase": ifguard_modify_in_codebase,
-        "ifguard_condition_simplify_in_codebase": ifguard_condition_simplify_in_codebase,
+        # "ifguard_condition_simplify_in_codebase": ifguard_condition_simplify_in_codebase,
         "rename_in_codebase": rename_in_codebase
     }
 
+# given an existing codebase and its patched version, reverse engineer the patch steps
+def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path: str, llm_usage_recorder: LLMUsageRecorder = LLMUsageRecorder()) -> dict:
+    # Plan / Execute / Decision / Replan loop
+    max_iterations = 8
+    original_code = open(original_codebase_path).read()
+    target_code = open(patched_codebase_path).read()
+    
+    # trim code to only the parts containing diffs
+
+ 
     current_code = original_code
     executed_plan = []
     last_msg = None
@@ -600,53 +635,62 @@ def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path:
         
         
         current_edit_distance = get_edit_distance(current_code, target_code)
-        # print("Current codebase:\n ", current_code)
-        # print("Target codebase:\n", target_code)
+        # mylogger.debug("Current codebase:\n ", current_code)
+        # mylogger.debug("Target codebase:\n", target_code)
         diff_text = compute_diff(current_code, target_code)
-        print("Code diff:\n", diff_text)
-        print(f"[PLAN] Iteration {iteration+1}: generating plan from current codebase")
+        mylogger.debug(f"Code diff:\n {diff_text}")
+        mylogger.debug(f"[PLAN] Iteration {iteration+1}: generating plan from current codebase")
         plan_prompt = PromptTemplate(
             template=(
-                "You are a patch planning agent. Given the original codebase and its patched codebase,"
-                "Follow the tool-selection rules and output only valid patch steps.\n" 
-                "Excluding compute_code_diff, the patch steps MUST be defined by the provided tools, and their payloads."
-                """
-                Instructions:
-                0. Compute the text difference between the original codebase and its patched codebase to understand the code changes.
-                1. For small changes including insertion/deletion of statements, USE insert_statements_in_codebase, remove_statements_from_codebase tools.
-                2. For statements moving from one place to another place in the codebase, USE move_statements_in_codebase tool.
-                3. For statement replacement satisfying the pattern: `if (X){{...}})` -> `if (Y){{...}})`, USE ifguard_modify_in_codebase tool.
-                4. For statement replacement satisfying the pattern: `X` -> `if (...){{X}})`, USE ifguard_statements_in_codebase tool. 
-                5. For statement changes satisfying the pattern: `if (X:complex_expression){{...}}` -> `bool a; a = X; if (a){{...}}` OR `bool a = X; if (a){{...}}`, USE ifguard_condition_simplify_in_codebase tool. 
-                
-                ### Original codebase:\n`{current}`\n
-                ### Patched codebase:\n`{target}`\n
-                ### Patch steps: `?`
+"You are a patch planning agent. Given the original codebase and its patched codebase,"
+"Follow the tool-selection rules and output only valid patch steps.\n" 
+"Excluding compute_code_diff, the patch steps MUST be defined by the provided tools, and their payloads."
+"""
+Instructions:
+0. Capture the text difference between the original codebase and its patched codebase to understand the code changes.
+1. For statements that change its location in the codebase, MUST USE move_statements_in_codebase tool.
+2. For statements that are newly added, USE insert_statements_in_codebase tool. For statements that are deleted from the codebase, USE remove_statements_from_codebase tool.
+3. For statement replacement satisfying the pattern: `if (X){{...}})` -> `if (Y){{...}})`, USE ifguard_modify_in_codebase tool.
+4. For statement replacement satisfying the pattern: `X` -> `if (...){{X}})`, USE ifguard_statements_in_codebase tool. 
+5. For other changes, select the other tools accordingly.
+            
+### Original codebase:\n`{current}`\n
+### Patched codebase:\n`{target}`\n
+### Patch steps: `?`
              
-                Output requirements:
-                MUST output a sequence of valid patch steps (up to TWO steps) with the following JSON format of array object:
-                [{{"tool": <tool_name>, "payload": {{ ... }}}}, ...., {{"tool": <tool_name>, "payload": {{ ... }}}}]
-                Make sure the payload fields strictly follow the tool argument names and types.
-                """
-                "All code content must be valid JSON strings (escape newlines \\n, tabs \\t) "
-                "No explanations. No fences."
+Output requirements:
+MUST output a sequence of valid patch steps with the following JSON format of array object:
+[{{"tool": <tool_name>, "payload": {{ ... }}}}, ...., {{"tool": <tool_name>, "payload": {{ ... }}}}]
+Make sure the payload fields exclude "codebase" and strictly follow the other tool argument names and types.
+Make sure each patch step is precise.
+"""
+"All code content must be valid JSON strings (escape newlines \\n, tabs \\t) "
+"No explanations. No fences."
             ),
             input_variables=["current", "target"],
         )
         raw_prompt = plan_prompt.format(current=current_code, target=target_code)
-        # print("[PLAN PROMPT]\n", raw_prompt)
+       
+        # mylogger.debug("[PLAN PROMPT]\n", raw_prompt)
         if user_error_feedback is not None and last_msg is not None:
-            error_prompt = f"The previous plan failed. {user_error_feedback}.\n Please generate new plan."
-            print("Error prompt: ", error_prompt)
-            plan_resp = planner.invoke({"messages": [create_user_message(raw_prompt), last_msg, create_user_message(error_prompt)]}, config={"recursion_limit": 50})
+            error_prompt = f"The previously inferred patch step does not work as expected. {user_error_feedback}. \nGenerate new sequence of valid patch steps."
+            plan_resp = planner.invoke({"messages": [create_user_message(raw_prompt), create_assistant_message(last_msg), create_user_message(error_prompt)]}, config={"recursion_limit": 50})
             user_error_feedback = None  # reset after adding to prompt
             last_msg = None # reset last message after using it
         else:
             plan_resp = planner.invoke({"messages": create_user_messages(raw_prompt)}, config={"recursion_limit": 50})
+            last_msg = None
+        
+        if hasattr(plan_resp, "messages"):
+            last_msg = getattr(plan_resp, "messages")[-1].content
+        if isinstance(plan_resp, dict):
+            last_msg = plan_resp.get("messages", [])[-1].content
             
         # parse plan JSON
         try:  
-            plan, last_msg = get_plan(response=plan_resp, llm_usage_recorder=llm_usage_recorder)
+            plan = get_plan(response=plan_resp, llm_usage_recorder=llm_usage_recorder)
+            last_msg = json.dumps(plan, indent=2) 
+            mylogger.debug(f"Patch plan output: {last_msg}")
         except Exception as e:
             user_error_feedback = str(e)
             import traceback
@@ -662,7 +706,7 @@ def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path:
         step = None 
         for step in plan:
             any_change = False
-            last_msg = create_assistant_message(json.dumps([step], indent=2))
+            last_msg = json.dumps([step], indent=2)
             tool_name = step.get("tool")
             args = step.get("payload", {})
             if tool_name.startswith("functions."):
@@ -681,29 +725,26 @@ def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path:
                         
             func = tool_map.get(tool_name)
             if func is None:
-                print(f"[ERROR] unknown tool: {tool_name}")
+                mylogger.debug(f"[ERROR] unknown tool: {tool_name}")
                 user_error_feedback = f"[ERROR]unknown tool: {tool_name}"
                 break # skip to next iteration for replanning
             
             # ensure codebase passed is the current_code when tool expects it
-            if current_code == args["codebase"] or equivalent_test(src=current_code, target=args["codebase"]):
-                pass 
-            else:
-                args["codebase"] = current_code
+            args["codebase"] = current_code
             
             try:
-                print(f"[EXECUTE] Calling {tool_name} with args {json.dumps(args, indent=2)}")
+                mylogger.debug(f"[EXECUTE] Calling {tool_name} with args {json.dumps(args, indent=2)}")
                 res = func.invoke(args)
             except TypeError as e:
-                print(f"[ERROR] Tool invocation failed: {e}")
+                mylogger.debug(f"[ERROR] Tool invocation failed: {e}")
                 user_error_feedback = f"[ERROR]Tool invocation failed: {e}"
                 break # skip to next iteration for replanning
 
             # Normalize result to string codebase if possible
             if isinstance(res, dict):
                 if getattr(res, "messages", None) is not None:
-                    last_msg = res["messages"][-1]
-                    new_code = last_msg.content
+                    last_msg = res["messages"][-1].content
+                    new_code = last_msg
                 else:
                     new_code = res.get("output") or res.get("codebase") or str(res)
             elif isinstance(res, HumanMessage):
@@ -724,24 +765,24 @@ def reverse_engineer_patches(original_codebase_path: str, patched_codebase_path:
                         current_code = new_code
                     else:
                         user_error_feedback = get_user_error_feedback(step) 
-                        print(user_error_feedback)
+                        # mylogger.debug(user_error_feedback)
                         break # skip to next iteration for replanning
             else:
                 user_error_feedback = get_user_error_feedback(step) 
-                print(user_error_feedback)
+                # mylogger.debug(user_error_feedback)
                 break # skip to next iteration for replanning
             # Decision phase: check if target reached
             if current_code == target_code or equivalent_test(src=current_code, target=target_code):
-                print("[DONE] Target codebase reached.")
+                mylogger.debug("[DONE] Target codebase reached.")
                 return {"executed": executed_plan, "target_code": target_code}
 
         # Replan decision
         if not any_change:
-            print("[REPLAN] No changes applied by plan; aborting to avoid infinite loop.")
+            mylogger.debug("[REPLAN] No changes applied by plan; aborting to avoid infinite loop.")
         else:
-            print("[REPLAN] Changes applied; generating new plan in next iteration.")
+            mylogger.debug("[REPLAN] Changes applied; generating new plan in next iteration.")
 
-    print("[COMPLETE] Max iterations reached or loop terminated. Returning executed plan and diff status.")
+    mylogger.debug("[COMPLETE] Max iterations reached or loop terminated. Returning executed plan and diff status.")
     return {"executed": executed_plan, "current_code_equals_target": current_code == target_code,  "target_code": target_code}
 
 
@@ -761,82 +802,82 @@ def patch_backport(original_vim_codebase_path: str, patched_vim_codebase_path: s
     except Exception as e:
         import traceback 
         traceback.print_exc()
-        print("Error: ", str(e))
-        return {
-            "error": True,
-            "success": False,
-        }
+        mylogger.debug(f"Error: {e}")
+        patched_plan = None 
+        # return {
+        #     "error": True,
+        #     "success": False,
+        # }
     
     backporter = create_patch_backporting_agent()
     
     fully_executed = True 
-    future_target_code = vim_patched_code
-    if "current_code_equals_target" in patched_plan:
+    if patched_plan is None:
         fully_executed = False 
-        future_target_code = patched_plan.get("target_code")
-    
-    executed_plan: dict = patched_plan.get("executed", {})
+    if patched_plan:
+        assert isinstance(patched_plan, dict)
+        if "current_code_equals_target" in patched_plan:
+            fully_executed = False 
+
+        executed_plan: dict = patched_plan.get("executed", {})
     
     BACKPORT_PATCH_PROMPT = PromptTemplate(
-        template="""You are expert at patch backporting. Your task is to backport the original patch from upstream codebase (vim) to the downstream codebase (neovim).
-        Original patch from upstream (vim) codebase: \n
-        ###Patch action: `{patch}`,\n
-        ###Upstream codebase: `{vim_old}`,\n
-        \n\n
+        template="""
+You are expert at patch backporting. Your task is to backport the original patch from upstream codebase (vim) to the downstream codebase (neovim).
+Original patch from upstream (vim) codebase: \n
+###Patch action: `{patch}`,\n
+###Upstream codebase: `{vim_old}`,\n
+
+Backport the above patch to the downstream (neovim) codebase:\n
+###Patch action: `?`,\n
+###Downstream codebase: `{neovim_old}`,\n
+
+Instruction:
+1. Compute and understand the code changes between upstream and downstream codebases.
+2. Backport the original patch action according to the identified code changes between upstream and downstream codebases.
+3. Generate the downstream patch action. Make sure the patch action is precise and valid.
         
-        Backport the above patch to the downstream (neovim) codebase:\n
-        ###Patch action: `?`,\n
-        ###Downstream codebase: `{neovim_old}`,\n
-        \n
-        
-        Instruction:
-        1. Compute and understand the code changes between upstream and downstream codebases.
-        2. Backport the original patch action according to the identified code changes between upstream and downstream codebases.
-        3. Generate the downstream patch action.
-        
-        Output Requirement: 
-        MUST output the backported patch action with the following JSON format of array object:
-        [{{"tool": <tool_name>, "args": {{ ... }}}}, ...., {{"tool": <tool_name>, "args": {{ ... }}}}]
-        No explanations. No fence.
+Output Requirement: 
+MUST output the backported patch action with the following JSON format of array object:
+[{{"tool": <tool_name>, "args": {{ ... }}}}, ...., {{"tool": <tool_name>, "args": {{ ... }}}}]
+No explanations. No fence.
         """,
         input_variables=["patch", "vim_old", "neovim_old"],
     )
     
     BACKPORT_PROMPT = PromptTemplate(
-        template="""You are expert at patch backporting. Your task is to backport the original patch from upstream codebase (vim) to the downstream codebase (neovim).
-        Original patch from upstream (vim) codebase: \n
-        ###Patch action: `[{patch}]`,\n
-        ###Original code: `{vim_old}`,\n
-        ###Patched code: `{vim_patched}`\n
-        \n\n
-        Backport the above patch to the downstream (neovim) codebase:\n
-        ###Patch action: `{neovim_patched}`,\n
-        ###Original code: `{neovim_old}`,\n
-        ###Patched code: `?` \n
-        \n
-        
-        Instruction:
-        * First, adapt the original patch action from upstream (vim) codebase to the downstream (neovim) codebase. There may need some modification to the original patch to accomodate the coding context or style of the downstream (neovim) codebase
-        * Second, STRICTLY implement the adapted patch action to the downstream (neovim) codebase.
+        template="""
+You are expert at patch backporting. Your task is to backport the original patch from upstream codebase (vim) to the downstream codebase (neovim).
+Original patch from upstream (vim) codebase: \n
+###Patch action: `[{patch}]`,\n
+###Original code: `{vim_old}`,\n
+###Patched code: `{vim_patched}`\n
+
+Backport the above patch to the downstream (neovim) codebase:\n
+###Patch action: `{neovim_patched}`,\n
+###Original code: `{neovim_old}`,\n
+###Patched code: `?` \n
+
+Instruction:
+1. adapt the original patch action from upstream (vim) codebase to the downstream (neovim) codebase. There may need some modification to the original patch to accomodate the coding context or style of the downstream (neovim) codebase
+2. STRICTLY implement the adapted patch action to the downstream (neovim) codebase.
        
-        Output Requirement: 
-        MUST output the patched code. No explanations. No fence.
-        """,
+Output Requirement: 
+MUST output the patched code. No explanations. No fence.
+""",
         input_variables=["patch", "vim_old", "vim_patched", "neovim_old"],
     )
     BACKPORT_PROMPT_Default = PromptTemplate(
-        template="""You are expert at patch backporting. Your task is to backport the original patch from upstream codebase to the downstream codebase.
-        Original patch from upstream(vim) codebase: \n
-        ###Original code: `{vim_old}`,\n
-        ###Patched code: `{vim_patched}`\n
-        \n\n
-        Backport the above patch to the downstream(neovim) codebase:\n
-        ###Original code: `{neovim_old}`,\n
-        ###Patched code: `?`,
+        template="""
+Below is a patch (including function before and function after) from vim, paired with a corresponding function before from neovim. 
+Adapt the patch from vim to neovim by generating the function after based on the given function before. \n
+### Function Before (vim):\n`{vim_old}`,\n
+### Function After (vim):\n`{vim_patched}`\n
+### Function Before (neovim):\n `{neovim_old}`,\n
+### Function After (neovim):\n,
         
-        Output Requirement: 
-        MUST output the patched code. No explanations. No fence.
-        """,
+RESPONSE FORMAT: Return the full transformed source code as raw text. Do NOT include any extra explanation, commentary, or markdown fences.
+""",
         input_variables=["vim_old", "vim_patched", "neovim_old"],
     )
      
@@ -847,16 +888,11 @@ def patch_backport(original_vim_codebase_path: str, patched_vim_codebase_path: s
             assert isinstance(patch, dict)
             vim_old = patch.get("args", {}).get("codebase")
             vim_new = patch.get("output")
-            prefix = patch.get("prefix")
-            suffix = patch.get("suffix")
+            prefix = patch.get("prefix", "")
+            suffix = patch.get("suffix", "")
             patch.pop("prefix")
             patch.pop("suffix")
-            if prefix is not None:
-                vim_old = prefix + vim_old
-                vim_new = prefix + vim_new
-            if suffix is not None:
-                vim_old = vim_old + suffix
-                vim_new = vim_new + suffix
+            
         
             assert vim_old is not None
             assert vim_new is not None 
@@ -866,20 +902,80 @@ def patch_backport(original_vim_codebase_path: str, patched_vim_codebase_path: s
                 # Option1: Two-phases inference (Patch action adaption + Patch Generation)
                 raw_prompt = BACKPORT_PATCH_PROMPT.format(patch=json.dumps(patch, indent=2), vim_old = vim_old, vim_patched = vim_new, neovim_old=neovim_old)
                 response = backporter.invoke({"messages": create_user_messages(raw_prompt)}, config={"recursion_limit": 50})
-                
-                plan, _ = get_plan(response=response, llm_usage_recorder=llm_usage_recorder)
-                
-                raw_prompt = BACKPORT_PROMPT.format(patch=json.dumps(patch, indent=2), vim_old = vim_old, vim_patched = vim_new, neovim_patched = json.dumps(plan, indent=2),neovim_old=neovim_old)
-                response = backporter.invoke({"messages": create_user_messages(raw_prompt)}, config={"recursion_limit": 50})
-                
-                # extract text content
-                code = get_code(response, llm_usage_recorder)
-                
-                neovim_old = code 
-                vim_old = vim_new
-                neovim_patched = neovim_old
+                if hasattr(response, "messages"):
+                    create_assistant_message(getattr(response, "messages")[-1].content)
+                if isinstance(response, dict):
+                    create_assistant_message(response.get("messages", [])[-1].content)
+                plan = get_plan(response=response, llm_usage_recorder=llm_usage_recorder)
+                try:
+                    if len(plan) > 1:
+                        raise Exception("Only support one step in the plan.")
+                    for step in plan:
+                        tool_name = step.get("tool")
+                        args = step.get("args", {})
+                        if tool_name.startswith("functions."):
+                            tool_name = tool_name.replace("functions.", "")
+                        step["tool"] = tool_name
+                               
+                        func = tool_map.get(tool_name)
+                        if func is None:
+                            mylogger.debug(f"[ERROR] unknown tool: {tool_name}")
+                            raise Exception(f"[ERROR]unknown tool: {tool_name}")
+                        
+                        
+                        try:
+                            # ensure codebase passed is the current_code when tool expects it
+                            args["codebase"] = neovim_old
+                            mylogger.debug(f"[EXECUTE] Calling {tool_name} with args {json.dumps(args, indent=2)}")
+                            res = func.invoke(args)
+                            args.pop("codebase")
+                        except TypeError as e:
+                            args.pop("codebase")
+                            mylogger.debug(f"[ERROR] Tool invocation failed: {e}")
+                            raise Exception(f"[ERROR]Tool invocation failed: {e}")
+
+                        # Normalize result to string codebase if possible
+                        if isinstance(res, dict):
+                            if getattr(res, "messages", None) is not None:
+                                last_msg = res["messages"][-1]
+                                new_code = last_msg.content
+                            else:
+                                new_code = res.get("output") or res.get("codebase") or str(res)
+                        elif isinstance(res, HumanMessage):
+                            new_code = res.content
+                        else:
+                            new_code = str(res)
+
+                        if new_code.startswith("```"):
+                            # strip code block markers if present
+                            new_code = "\n".join(new_code.strip().split("\n")[1:-1])
+                        
+                        if " ".join(new_code.strip().split()) == " ".join(neovim_old.strip().split()):
+                            raise Exception("No change applied by plan.") 
+                       
+                        neovim_old = new_code
+                    
+                    vim_old = vim_new
+                    neovim_patched = neovim_old
+                        
+                except Exception as e:
+                    raw_prompt = BACKPORT_PROMPT.format(patch=json.dumps(patch, indent=2), vim_old = prefix + vim_old + suffix, vim_patched = prefix + vim_new + suffix, neovim_patched = json.dumps(plan, indent=2),neovim_old=neovim_old)
+                    response = backporter.invoke({"messages": create_user_messages(raw_prompt)}, config={"recursion_limit": 50})
+                    
+                    # extract text content
+                    code = get_code(response, llm_usage_recorder)
+                    
+                    neovim_old = code 
+                    vim_old = vim_new
+                    neovim_patched = neovim_old
             
             except:
+                if prefix is not None:
+                    vim_old = prefix + vim_old
+                    vim_new = prefix + vim_new
+                if suffix is not None:
+                    vim_old = vim_old + suffix
+                    vim_new = vim_new + suffix
                 # Option1: One-phase inference (Patch Generation)
                 raw_prompt = BACKPORT_PROMPT.format(patch=json.dumps(patch, indent=2), vim_old = vim_old, vim_patched = vim_new, neovim_patched = "?",neovim_old=neovim_old)
                 response = backporter.invoke({"messages": create_user_messages(raw_prompt)}, config={"recursion_limit": 50})
@@ -910,7 +1006,7 @@ def patch_backport(original_vim_codebase_path: str, patched_vim_codebase_path: s
             "vim_code": vim_code,
             "vim_patch_plan": patched_plan,
             "neovim_code": neovim_code,
-            "patched": neovim_old,
+            "patched": neovim_patched,
             "llm_report": llm_usage_recorder.report()
             }
 
@@ -926,7 +1022,7 @@ if __name__ == "__main__":
     
     try:
         result = patch_backport(args.original_codebase_path, args.patched_codebase_path, args.new_codebase_path)
-        print(json.dumps(result))
+        mylogger.debug(json.dumps(result))
     except Exception as e:
         import traceback
         traceback.print_exc()

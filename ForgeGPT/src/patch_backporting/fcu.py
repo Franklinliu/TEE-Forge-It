@@ -115,6 +115,8 @@ class FunctionCompareUtilities:
                 normalized_children = list(self.normalized_children(current_node))
                 for sub_node in normalized_children:
                     dfs(sub_node)
+                # for sub_node in current_node.children:
+                #     dfs(sub_node)
 
         tokens = []
         dfs(func_tree.root_node)

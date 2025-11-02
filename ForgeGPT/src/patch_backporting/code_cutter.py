@@ -164,7 +164,7 @@ def trim_code_containing_diff(left_code:str, right_code:str) -> tuple[str, str]:
 				"start_byte": 0,
 				"end_byte": len(right_code),
 				"code": right_code
-			}}
+			}} # type: ignore
 
 	# Compute diff hunks
 	hunks = compute_diff_hunks(left_code, right_code)
